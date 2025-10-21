@@ -322,7 +322,8 @@ app.post('/api/auth/register/start', async (req, res) => {
   try {
     const { name, email, phone, password, role } = req.body || {};
     if (!name || !email || !password) return res.status(400).json({ message: 'Missing fields' });
-    const finalRole = role === 'admin' ? 'admin' : 'user';
+    // Force all registrations to be 'user' role - Admin privileges assigned manually via Supabase
+    const finalRole = 'user';
 
     // Prevent starting registration if email already exists (reliable by-email)
     const exists = await emailExists(email);
@@ -383,18 +384,21 @@ app.post('/api/auth/register/verify', async (req, res) => {
     }
     if (entry.code !== providedCode) return res.status(400).json({ message: 'Invalid OTP' });
 
+    // Security: Ensure role is always 'user' for new registrations (admin assigned manually)
+    const safeRole = 'user';
+    
     // Create the user (confirmed) via Admin API
     const { data: created, error: createError } = await supabaseAdmin.auth.admin.createUser({
       email: entry.email,
       password: entry.password,
       email_confirm: true,
-      user_metadata: { name: entry.name, phone: entry.phone, role: entry.role },
+      user_metadata: { name: entry.name, phone: entry.phone, role: safeRole },
     });
     if (createError) return res.status(400).json({ message: createError.message });
     const newUser = created.user;
 
     // Ensure a profile row exists
-    await supabaseAdmin.from('profiles').upsert({ id: newUser.id, name: entry.name, phone: entry.phone, role: entry.role });
+    await supabaseAdmin.from('profiles').upsert({ id: newUser.id, name: entry.name, phone: entry.phone, role: safeRole });
 
     // Sign in to mint an access token for the client
     const { data: signInData, error: signInError } = await supabaseAnon.auth.signInWithPassword({ email: entry.email, password: entry.password });
@@ -410,7 +414,7 @@ app.post('/api/auth/register/verify', async (req, res) => {
         id: newUser.id, 
         name: entry.name, 
         email: entry.email, 
-        role: entry.role,
+        role: safeRole,
         createdAt: formatDate(newUser.created_at),
         memberSince: formatDate(newUser.created_at),
         lastLoginAt: new Date().toISOString()
@@ -1196,6 +1200,61 @@ app.get('/api/user/overview', auth('user'), (req, res) => {
   res.json({ message: 'user data' });
 });
 
+// Owner-specific routes
+app.get('/api/owner/turfs', auth(), async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('turfs')
+      .select('*')
+      .eq('owner', req.user.sub)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(400).json({ message: error.message });
+    
+    res.json({ turfs: (data || []).map(mapTurfRowToApi) });
+  } catch (e) {
+    console.error('Error fetching owner turfs:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all bookings for owner's turfs
+app.get('/api/owner/bookings', auth(), async (req, res) => {
+  try {
+    // First get owner's turfs
+    const { data: turfs, error: turfError } = await supabaseAdmin
+      .from('turfs')
+      .select('id, name')
+      .eq('owner', req.user.sub);
+
+    if (turfError) return res.status(400).json({ message: turfError.message });
+
+    const turfIds = (turfs || []).map(t => t.id);
+    
+    if (turfIds.length === 0) {
+      return res.json({ bookings: [] });
+    }
+
+    // Get all bookings for owner's turfs
+    const { data: bookings, error: bookingError } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .in('turf_id', turfIds)
+      .order('created_at', { ascending: false });
+
+    if (bookingError) return res.status(400).json({ message: bookingError.message });
+
+    const turfNameMap = Object.fromEntries((turfs || []).map(t => [t.id, t.name]));
+    
+    res.json({ 
+      bookings: (bookings || []).map(r => mapBookingRowToApi(r, turfNameMap)) 
+    });
+  } catch (e) {
+    console.error('Error fetching owner bookings:', e);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 function mapTurfRowToApi(row) {
   let finalLocation;
   let locationAddress;
@@ -1239,6 +1298,7 @@ function mapTurfRowToApi(row) {
     pricePerHour: Number(row.price_per_hour) || 0, // Ensure it's a number
     operatingHours: row.operating_hours || { open: '06:00', close: '22:00' },
     amenities: Array.isArray(row.amenities) ? row.amenities : [],
+    owner: row.owner,
     createdAt: formatDate(row.created_at),
     updatedAt: formatDate(row.updated_at)
   };
@@ -1273,6 +1333,8 @@ function mapBookingRowToApi(row, turfNameMap = {}) {
     paymentStatus: row.payment_status || 'completed',
     paymentMethod: row.payment_method || null,
     bookingStatus: row.booking_status || 'confirmed',
+    bookingType: row.booking_type || 'customer',
+    notes: row.notes || null,
     razorpayOrderId: row.razorpay_order_id || null,
     razorpayPaymentId: row.razorpay_payment_id || null,
     cancelledAt: row.cancelled_at || null,
@@ -1663,6 +1725,8 @@ app.post('/api/bookings', auth(), async (req, res) => {
       userEmail,
       userPhone,
       paymentMethod = 'cash',
+      bookingType = 'customer',
+      notes = ''
     } = req.body || {};
 
     if (!turfId || !date || !startTime || !endTime || !userName || !userEmail || !paymentMethod) {
@@ -1670,7 +1734,7 @@ app.post('/api/bookings', auth(), async (req, res) => {
     }
 
     // Validate payment method
-    if (!['cash', 'online'].includes(paymentMethod)) {
+    if (!['cash', 'online', 'owner'].includes(paymentMethod)) {
       return res.status(400).json({ message: 'Invalid payment method' });
     }
 
@@ -1681,14 +1745,17 @@ app.post('/api/bookings', auth(), async (req, res) => {
       return res.status(400).json({ message: 'Invalid time range' });
     }
 
-    // Ensure turf exists
+    // Ensure turf exists and get owner info
     const { data: turfRow, error: turfErr } = await supabaseAdmin
       .from('turfs')
-      .select('id, name, operating_hours, price_per_hour')
+      .select('id, name, operating_hours, price_per_hour, owner')
       .eq('id', turfId)
       .single();
     if (turfErr) return res.status(400).json({ message: turfErr.message });
     if (!turfRow) return res.status(404).json({ message: 'Turf not found' });
+
+    // Check if user is the turf owner
+    const isOwner = turfRow.owner === req.user.sub;
 
     // Availability check: no overlapping confirmed bookings for same date
     // (tentative bookings older than 15 minutes are ignored)
@@ -1717,19 +1784,36 @@ app.post('/api/bookings', auth(), async (req, res) => {
     
     if (conflict) return res.status(409).json({ message: 'Selected time overlaps an existing booking' });
 
-    // Default total if not provided
+    // Default total if not provided, but free for owners
     const durationHours = (eMin - sMin) / 60;
-    const computedTotal = Number(totalAmount ?? (Number(turfRow.price_per_hour) * durationHours));
+    let computedTotal = Number(totalAmount ?? (Number(turfRow.price_per_hour) * durationHours));
+    
+    // Override payment method and amount for owners
+    let finalPaymentMethod = paymentMethod;
+    let finalBookingType = bookingType;
+    
+    if (isOwner) {
+      computedTotal = 0; // Free for owners
+      finalPaymentMethod = 'owner';
+      finalBookingType = bookingType || 'owner';
+    } else if (paymentMethod === 'owner') {
+      // Prevent non-owners from using owner payment method
+      return res.status(403).json({ message: 'Only turf owners can use owner payment method' });
+    }
 
     // Set payment status and booking status based on payment method
     let paymentStatus, bookingStatus;
     
-    if (paymentMethod === 'cash') {
+    if (finalPaymentMethod === 'owner') {
+      // Owner bookings: free and immediately confirmed
+      paymentStatus = 'completed';
+      bookingStatus = 'confirmed';
+    } else if (finalPaymentMethod === 'cash') {
       // Cash payments: create booking immediately with pending payment
       paymentStatus = 'pending';
       bookingStatus = 'confirmed';
       
-      // Create the booking record for cash payments
+      // Create the booking record
       const payload = {
         turf_id: turfId,
         turf_name: turfRow.name,
@@ -1742,8 +1826,10 @@ app.post('/api/bookings', auth(), async (req, res) => {
         end_time: endTime,
         total_amount: computedTotal,
         payment_status: paymentStatus,
-        payment_method: paymentMethod,
+        payment_method: finalPaymentMethod,
         booking_status: bookingStatus,
+        booking_type: finalBookingType,
+        notes: notes,
         // Cash payments don't need owner settlements (handled directly at turf)
         payout_amount: null,
         owner_settlement_status: 'completed', // Cash payments are settled immediately
@@ -1757,7 +1843,16 @@ app.post('/api/bookings', auth(), async (req, res) => {
       if (createErr) return res.status(400).json({ message: createErr.message });
 
       const api = mapBookingRowToApi(created, { [turfId]: turfRow.name });
-      res.status(201).json({ booking: api });
+      const response = { 
+        booking: api,
+        isOwnerBooking: isOwner
+      };
+      
+      if (isOwner) {
+        response.message = 'Owner booking created successfully - no payment required';
+      }
+      
+      res.status(201).json(response);
       
     } else {
       // Online payments: don't create booking record yet, just return booking details for payment
